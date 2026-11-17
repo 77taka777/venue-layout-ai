@@ -5,7 +5,7 @@ import { CATALOG } from '../core/catalog'
 import { chatState } from '../core/ops'
 import { venueInfo } from '../core/planner'
 import type { Plan, Project, SourceImage } from '../core/types'
-import { aiImages, capability } from '../io/files'
+import { aiImages } from '../io/files'
 
 type SampleFn = ((input: any, opts?: any) => Promise<{ text: string; truncated: boolean }>) & {
   json: (input: any, opts?: any) => Promise<any>
@@ -21,7 +21,55 @@ let cached: SampleFn | null | undefined
 
 export async function getSample(): Promise<SampleFn | null> {
   if (cached !== undefined) return cached
-  cached = await capability<SampleFn>('sample')
+  
+  const request = async (input: any, opts: any = {}) => {
+    const images = await Promise.all((opts.images ?? []).map(async (blob: Blob) => {
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(String(reader.result || ''))
+        reader.onerror = () => reject(new Error('image read failed'))
+        reader.readAsDataURL(blob)
+      })
+      const comma = dataUrl.indexOf(',')
+      return { mediaType: dataUrl.slice(5, dataUrl.indexOf(';')), data: dataUrl.slice(comma + 1) }
+    }))
+    let response: Response
+    try {
+      response = await fetch('/api/ai', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt: String(input), images }),
+        signal: opts.signal,
+      })
+    } catch (e: any) {
+      if (opts.signal?.aborted || e?.name === 'AbortError') throw { code: 'cancelled' }
+      throw { code: 'upstream_unavailable' }
+    }
+    const result = await response.json().catch(() => null)
+    if (!response.ok) throw { code: typeof result?.error === 'string' ? result.error : 'upstream_error' }
+    if (typeof result?.text !== 'string') throw { code: 'empty_completion' }
+    opts.onText?.({ text: result.text })
+    return result
+  }
+  const client = Object.assign(
+    async (input: any, opts?: any) => request(input, opts),
+    {
+      json: async (input: any, opts?: any) => {
+        const result = await request(input, opts)
+        if (result.truncated) throw { code: 'prompt_too_large' }
+        const text = result.text.trim().replace(/^\u0060{3}(?:json)?\s*/i, '').replace(/\s*\u0060{3}$/, '')
+        try { return JSON.parse(text) } catch { throw { code: 'invalid_json' } }
+      },
+      limits: async () => {
+        try {
+          const response = await fetch('/api/ai', { cache: 'no-store' })
+          const status = await response.json()
+          return status?.available ? { images: { maxCount: 2 } } : {}
+        } catch { return {} }
+      },
+    },
+  ) as SampleFn
+  cached = client
   return cached
 }
 
@@ -30,9 +78,10 @@ export async function aiStatus(): Promise<AiStatus> {
   if (!s) return { sample: false, images: false }
   try {
     const lim = await s.limits()
-    return { sample: true, images: !!lim?.images }
+    const available = !!lim?.images
+    return { sample: available, images: available }
   } catch {
-    return { sample: true, images: false }
+    return { sample: false, images: false }
   }
 }
 
